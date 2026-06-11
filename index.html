@@ -74,7 +74,6 @@
     box-shadow:0 2px 6px rgba(23,33,27,.12);
     padding:16px 16px 22px;
     position:relative;
-    /* perforated zigzag bottom edge */
     clip-path:polygon(0 0,100% 0,100% calc(100% - 8px),
       97.5% 100%,95% calc(100% - 8px),92.5% 100%,90% calc(100% - 8px),
       87.5% 100%,85% calc(100% - 8px),82.5% 100%,80% calc(100% - 8px),
@@ -169,10 +168,9 @@
 </div>
 
 <script>
-const receipts = []; // in-memory only — refreshing the page clears the list
+const receipts = [];
 const $ = id => document.getElementById(id);
 
-// Detect restricted preview environments up front: probe the language-data CDN
 (async () => {
   try {
     await fetch('https://tessdata.projectnaptha.com/4.0.0/eng.traineddata.gz',
@@ -182,14 +180,14 @@ const $ = id => document.getElementById(id);
   }
 })();
 
-/* ---------- live camera (falls back to photo picker if unavailable) ---------- */
+/* ---------- live camera ---------- */
 let camStream = null;
 
 $('btnScan').addEventListener('click', openCamera);
 
 async function openCamera(){
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
-    $('fileInput').click(); // no camera API (old browser / non-HTTPS) → photo picker
+    $('fileInput').click();
     return;
   }
   try {
@@ -200,7 +198,6 @@ async function openCamera(){
     $('camVideo').srcObject = camStream;
     $('camOverlay').classList.add('show');
   } catch (err) {
-    // permission denied or blocked context → fall back to photo picker
     $('fileInput').click();
   }
 }
@@ -214,7 +211,7 @@ function closeCamera(){
 $('camCancel').addEventListener('click', closeCamera);
 $('camShutter').addEventListener('click', () => {
   const v = $('camVideo');
-  if (!v.videoWidth) return; // stream not ready yet
+  if (!v.videoWidth) return;
   const c = document.createElement('canvas');
   c.width = v.videoWidth; c.height = v.videoHeight;
   c.getContext('2d').drawImage(v, 0, 0);
@@ -238,18 +235,22 @@ function setStatus(msg, pct, isErr){
 }
 function clearStatus(){ $('status').className=''; }
 
-// downscale photo before OCR — faster and often MORE accurate
-function downscale(file, maxDim){
+// Upscale small receipts, cap huge photos — better OCR on both ends
+function prepareImage(file){
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
-      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const longest = Math.max(img.width, img.height);
+      const TARGET = 2000;
+      // upscale small images up to 2×; shrink very large ones down to TARGET
+      const scale = longest < TARGET
+        ? Math.min(2, TARGET / longest)
+        : Math.min(1, TARGET / longest);
       const c = document.createElement('canvas');
-      c.width = Math.round(img.width * scale);
+      c.width  = Math.round(img.width  * scale);
       c.height = Math.round(img.height * scale);
       const ctx = c.getContext('2d');
-      // grayscale + contrast bump helps thermal receipts
-      ctx.filter = 'grayscale(1) contrast(1.3)';
+      ctx.filter = 'grayscale(1) contrast(1.6)';
       ctx.drawImage(img, 0, 0, c.width, c.height);
       resolve(c);
       URL.revokeObjectURL(img.src);
@@ -259,7 +260,7 @@ function downscale(file, maxDim){
   });
 }
 
-let ocrWorker = null; // reuse across scans — engine loads once
+let ocrWorker = null;
 
 async function getWorker(){
   if (ocrWorker) return ocrWorker;
@@ -273,13 +274,15 @@ async function getWorker(){
         setStatus('Loading OCR engine… (' + m.status + ')', 5 + Math.round(m.progress * 15));
     }
   });
+  // PSM 4 = single column of variable-size text — much better for receipts than default PSM 3
+  await ocrWorker.setParameters({ tessedit_pageseg_mode: '4' });
   return ocrWorker;
 }
 
 async function scanImage(file){
   try {
     setStatus('Preparing image…', 5);
-    const canvas = await downscale(file, 1600);
+    const canvas = await prepareImage(file);
     setStatus('Loading OCR engine (first scan downloads ~10 MB)…', 10);
     const worker = await getWorker();
     const result = await worker.recognize(canvas);
@@ -293,17 +296,24 @@ async function scanImage(file){
     render();
   } catch (err) {
     console.error(err);
-    ocrWorker = null; // force fresh engine on retry
+    ocrWorker = null;
     const msg = (err && err.message) ? err.message
       : 'the OCR engine could not download its files. This usually means the page is running in a restricted preview — save this file and open it in Safari directly.';
     setStatus('OCR failed: ' + msg, 0, true);
   }
 }
 
-/* ---------- parsing: turn raw OCR text into structured data ---------- */
+/* ---------- parsing ---------- */
+
+// Known store names — matched against every line before falling back to heuristics
+const KNOWN_STORES = /\b(walmart|wal[\s*-]?mart|target|costco|kroger|safeway|whole\s*foods|trader\s*joe['s]*|cvs|walgreens|rite\s*aid|dollar\s*tree|dollar\s*general|family\s*dollar|aldi|lidl|publix|h[\s.]*e[\s.]*b|meijer|wegmans|food\s*lion|winco|sprouts|tj\s*maxx|homegoods|marshalls|home\s*depot|lowe['s]*|best\s*buy|staples|office\s*depot|amazon|mcdonald['s]*|starbucks|subway|chick[\s-]fil|chipotle|domino['s]*|pizza\s*hut|taco\s*bell|burger\s*king|wendy['s]*|sonic|panera|dunkin|in[\s-]n[\s-]out|trader\s*joe)\b/i;
+
+// Lines that look like footer/promo text — skip when guessing merchant from position
+const JUNK_MERCHANT = /\b(feedback|survey|thank|cashier|register|mgr|manager|tel|phone|fax|www\.|\.com|\.net|scan|download|app|welcome|invite|save\s+big|follow\s+us|receipt\s*#|transaction|approval|auth)\b/i;
+
 function parseReceipt(text){
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  const priceRe = /(.*?)[\s.]*\$?\s*(-?\d{1,5}[.,]\d{2})\s*$/;
+  const priceRe = /(.*?)[\s.]*\$?\s*(-?\d{1,5}[.,]\d{2})[A-Z*]?\s*$/;
   const dateRe  = /(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})|(\d{4}-\d{2}-\d{2})/;
   const skipRe  = /^(visa|mastercard|amex|debit|credit|cash|change|tend|auth|approval|card|account|balance|x{2,})/i;
   const taxRe   = /\b(tax|hst|gst|pst|vat)\b/i;
@@ -312,28 +322,40 @@ function parseReceipt(text){
 
   const r = { id: Date.now(), merchant: '', date: '', items: [], tax: null, total: null };
 
-  // merchant: first line with letters that isn't a date/address-ish number blob
-  for (const l of lines.slice(0, 4)){
-    if (/[A-Za-z]{3,}/.test(l) && !dateRe.test(l)) { r.merchant = l.replace(/[^\w\s&'.-]/g,'').trim(); break; }
+  // 1. Scan ALL lines for a known store name first (most reliable)
+  for (const l of lines){
+    const m = l.match(KNOWN_STORES);
+    if (m){ r.merchant = m[0].trim(); break; }
   }
+
+  // 2. Fall back: first non-junk line in the top 8 that has real letters
+  if (!r.merchant){
+    for (const l of lines.slice(0, 8)){
+      if (/[A-Za-z]{3,}/.test(l) && !dateRe.test(l) && !JUNK_MERCHANT.test(l) && !/^\d/.test(l)){
+        r.merchant = l.replace(/[^\w\s&'.-]/g,'').trim();
+        break;
+      }
+    }
+  }
+
   if (!r.merchant) r.merchant = 'Unknown merchant';
 
   for (const l of lines){
     if (!r.date){ const d = l.match(dateRe); if (d) r.date = d[0]; }
     const m = l.match(priceRe);
     if (!m) continue;
-    const name = m[1].trim();
+    const name  = m[1].trim();
     const price = parseFloat(m[2].replace(',', '.'));
     if (isNaN(price)) continue;
 
-    if (subRe.test(name)) continue;                       // skip subtotal rows
-    if (totalRe.test(name)) { r.total = price; continue } // capture total
-    if (taxRe.test(name))   { r.tax = (r.tax||0) + price; continue }
-    if (skipRe.test(name) || !name) continue;             // skip payment noise
-    if (price > 10000) continue;                          // junk guard
+    if (subRe.test(name))   continue;
+    if (totalRe.test(name)) { r.total = price; continue; }
+    if (taxRe.test(name))   { r.tax = (r.tax||0) + price; continue; }
+    if (skipRe.test(name) || !name) continue;
+    if (price > 10000) continue;
     r.items.push({ name: name.replace(/\s{2,}/g,' '), price });
   }
-  // fall back: if no TOTAL keyword found, use items + tax
+
   if (r.total == null && r.items.length)
     r.total = +(r.items.reduce((s,i)=>s+i.price,0) + (r.tax||0)).toFixed(2);
   return r;
@@ -348,7 +370,6 @@ function render(){
   $('statTotal').textContent = fmt(receipts.reduce((s,r)=>s+(r.total||0),0));
   $('btnCsv').disabled = !receipts.length;
 
-  // remove old cards
   document.querySelectorAll('.receipt').forEach(el => el.remove());
 
   for (const r of receipts){
@@ -372,7 +393,6 @@ function render(){
 }
 function esc(s){ return String(s||'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
-// inline edits + delete (event delegation)
 document.addEventListener('focusout', e => {
   const el = e.target.closest('[contenteditable]'); if (!el) return;
   const r = receipts.find(x => x.id == el.dataset.id); if (!r) return;
@@ -387,7 +407,7 @@ document.addEventListener('click', e => {
   if (i > -1){ receipts.splice(i,1); render(); }
 });
 
-/* ---------- CSV export: one row per line item, plus tax & total rows ---------- */
+/* ---------- CSV export ---------- */
 $('btnCsv').addEventListener('click', () => {
   const rows = [['receipt_id','merchant','date','row_type','item','amount']];
   for (const r of receipts){
