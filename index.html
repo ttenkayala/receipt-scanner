@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Receipt Scanner — Offline OCR</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js"></script>
+<style>
+  :root{
+    --paper:#FCFBF7;
+    --ink:#17211B;
+    --ledger:#1F6B4A;
+    --ledger-soft:#E4F0E9;
+    --rule:#C9CFC9;
+    --warn:#B4452B;
+    --bg:#EAEDE8;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%}
+  body{
+    background:var(--bg);
+    color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    padding-bottom:120px;
+  }
+  .mono{font-family:ui-monospace,"SF Mono","Menlo","Courier New",monospace}
+
+  header{
+    background:var(--ledger);
+    color:#fff;
+    padding:calc(env(safe-area-inset-top, 0px) + 16px) 18px 14px;
+    position:sticky;top:0;z-index:10;
+    display:flex;align-items:baseline;justify-content:space-between;gap:10px;
+  }
+  header h1{font-size:17px;font-weight:700;letter-spacing:.02em}
+  header .sub{font-size:11px;opacity:.85;font-family:ui-monospace,monospace}
+
+  .toolbar{
+    display:flex;gap:10px;padding:14px 16px 4px;align-items:center;
+  }
+  .stat{
+    flex:1;background:var(--paper);border:1px solid var(--rule);border-radius:10px;
+    padding:10px 12px;
+  }
+  .stat .label{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#5C6B61}
+  .stat .value{font-size:20px;font-weight:700;font-family:ui-monospace,monospace}
+
+  .actions{display:flex;gap:10px;padding:12px 16px}
+  button{
+    font:inherit;border:none;border-radius:12px;padding:14px 16px;font-weight:700;
+    font-size:15px;cursor:pointer;flex:1;
+  }
+  .btn-scan{background:var(--ledger);color:#fff}
+  .btn-scan:active{transform:scale(.98)}
+  .btn-csv{background:var(--paper);color:var(--ledger);border:1.5px solid var(--ledger)}
+  .btn-csv:disabled{opacity:.4}
+  input[type=file]{display:none}
+
+  #status{
+    margin:4px 16px;padding:10px 12px;border-radius:10px;font-size:13px;
+    background:var(--ledger-soft);color:var(--ledger);display:none;
+    font-family:ui-monospace,monospace;
+  }
+  #status.err{background:#F6E4DE;color:var(--warn)}
+  #status.show{display:block}
+  .bar{height:4px;background:#fff;border-radius:2px;margin-top:8px;overflow:hidden}
+  .bar i{display:block;height:100%;width:0;background:var(--ledger);transition:width .2s}
+
+  /* the receipt stack */
+  #stack{padding:10px 16px;display:flex;flex-direction:column;gap:18px}
+  .receipt{
+    background:var(--paper);
+    box-shadow:0 2px 6px rgba(23,33,27,.12);
+    padding:16px 16px 22px;
+    position:relative;
+    /* perforated zigzag bottom edge */
+    clip-path:polygon(0 0,100% 0,100% calc(100% - 8px),
+      97.5% 100%,95% calc(100% - 8px),92.5% 100%,90% calc(100% - 8px),
+      87.5% 100%,85% calc(100% - 8px),82.5% 100%,80% calc(100% - 8px),
+      77.5% 100%,75% calc(100% - 8px),72.5% 100%,70% calc(100% - 8px),
+      67.5% 100%,65% calc(100% - 8px),62.5% 100%,60% calc(100% - 8px),
+      57.5% 100%,55% calc(100% - 8px),52.5% 100%,50% calc(100% - 8px),
+      47.5% 100%,45% calc(100% - 8px),42.5% 100%,40% calc(100% - 8px),
+      37.5% 100%,35% calc(100% - 8px),32.5% 100%,30% calc(100% - 8px),
+      27.5% 100%,25% calc(100% - 8px),22.5% 100%,20% calc(100% - 8px),
+      17.5% 100%,15% calc(100% - 8px),12.5% 100%,10% calc(100% - 8px),
+      7.5% 100%,5% calc(100% - 8px),2.5% 100%,0 calc(100% - 8px));
+  }
+  .receipt .head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+  .receipt .merchant{
+    font-family:ui-monospace,monospace;font-weight:700;font-size:15px;
+    text-transform:uppercase;letter-spacing:.04em;min-width:60px;
+  }
+  .receipt .date{font-family:ui-monospace,monospace;font-size:12px;color:#5C6B61}
+  .receipt .del{
+    flex:0 0 auto;background:none;border:none;color:var(--warn);font-size:12px;
+    padding:2px 6px;font-weight:600;
+  }
+  .receipt hr{border:none;border-top:1.5px dashed var(--rule);margin:10px 0}
+  .receipt .line{
+    display:flex;justify-content:space-between;gap:12px;
+    font-family:ui-monospace,monospace;font-size:13px;padding:3px 0;
+  }
+  .line .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .line .price{flex:0 0 auto}
+  .line.tax .name,.line.tax .price{color:#5C6B61}
+  .line.total{font-weight:700;font-size:15px;border-top:1.5px dashed var(--rule);
+    margin-top:6px;padding-top:8px}
+  [contenteditable]{border-bottom:1px dotted transparent;outline:none}
+  [contenteditable]:focus{border-bottom-color:var(--ledger);background:var(--ledger-soft)}
+
+  .empty{
+    text-align:center;color:#5C6B61;padding:60px 30px;font-size:14px;line-height:1.6;
+  }
+  .empty .mono{display:block;font-size:32px;margin-bottom:12px}
+
+  /* live camera overlay */
+  #camOverlay{position:fixed;inset:0;background:#000;z-index:50;display:none;flex-direction:column}
+  #camOverlay.show{display:flex}
+  #camVideo{flex:1;width:100%;min-height:0;object-fit:cover}
+  .cam-hint{position:absolute;top:calc(env(safe-area-inset-top,0px) + 16px);left:0;right:0;
+    text-align:center;color:#fff;font-size:13px;text-shadow:0 1px 3px #000;z-index:51}
+  .cam-controls{display:flex;align-items:center;justify-content:space-between;
+    padding:18px 32px calc(env(safe-area-inset-bottom,0px) + 18px);background:#000}
+  #camShutter{width:68px;height:68px;border-radius:50%;background:#fff;
+    border:4px solid #999;flex:0 0 auto;padding:0}
+  #camShutter:active{background:#ccc}
+  #camCancel{background:none;border:none;color:#fff;font-size:15px;font-weight:600;
+    flex:0 0 auto;padding:10px;width:68px}
+  .cam-spacer{width:68px;flex:0 0 auto}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Receipt Scanner</h1>
+  <span class="sub">offline · tesseract OCR</span>
+</header>
+
+<div class="toolbar">
+  <div class="stat"><div class="label">Receipts</div><div class="value" id="statCount">0</div></div>
+  <div class="stat"><div class="label">Grand total</div><div class="value" id="statTotal">$0.00</div></div>
+</div>
+
+<div class="actions">
+  <button class="btn-scan" id="btnScan">📷 Scan receipt</button>
+  <button class="btn-csv" id="btnCsv" disabled>Export CSV</button>
+</div>
+<input type="file" id="fileInput" accept="image/*" capture="environment">
+
+<div id="camOverlay">
+  <div class="cam-hint">Fill the frame with the receipt</div>
+  <video id="camVideo" autoplay playsinline muted></video>
+  <div class="cam-controls">
+    <button id="camCancel">Cancel</button>
+    <button id="camShutter" aria-label="Take photo"></button>
+    <span class="cam-spacer"></span>
+  </div>
+</div>
+
+<div id="status"><span id="statusText"></span><div class="bar"><i id="statusBar"></i></div></div>
+
+<div id="stack">
+  <div class="empty" id="empty">
+    <span class="mono">⌁</span>
+    No receipts yet.<br>Tap <b>Scan receipt</b> to photograph one — everything runs on your phone, nothing is uploaded.
+  </div>
+</div>
+
+<script>
+const receipts = []; // in-memory only — refreshing the page clears the list
+const $ = id => document.getElementById(id);
+
+// Detect restricted preview environments up front: probe the language-data CDN
+(async () => {
+  try {
+    await fetch('https://tessdata.projectnaptha.com/4.0.0/eng.traineddata.gz',
+      { method: 'HEAD', mode: 'no-cors' });
+  } catch (e) {
+    setStatus('⚠ This environment blocks the OCR engine downloads. Save this HTML file and open it directly in Safari — it will work there.', 0, true);
+  }
+})();
+
+/* ---------- live camera (falls back to photo picker if unavailable) ---------- */
+let camStream = null;
+
+$('btnScan').addEventListener('click', openCamera);
+
+async function openCamera(){
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    $('fileInput').click(); // no camera API (old browser / non-HTTPS) → photo picker
+    return;
+  }
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false
+    });
+    $('camVideo').srcObject = camStream;
+    $('camOverlay').classList.add('show');
+  } catch (err) {
+    // permission denied or blocked context → fall back to photo picker
+    $('fileInput').click();
+  }
+}
+
+function closeCamera(){
+  if (camStream){ camStream.getTracks().forEach(t => t.stop()); camStream = null; }
+  $('camVideo').srcObject = null;
+  $('camOverlay').classList.remove('show');
+}
+
+$('camCancel').addEventListener('click', closeCamera);
+$('camShutter').addEventListener('click', () => {
+  const v = $('camVideo');
+  if (!v.videoWidth) return; // stream not ready yet
+  const c = document.createElement('canvas');
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext('2d').drawImage(v, 0, 0);
+  closeCamera();
+  c.toBlob(b => b && scanImage(b), 'image/jpeg', 0.92);
+});
+
+$('fileInput').addEventListener('change', async e => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  await scanImage(file);
+});
+
+function setStatus(msg, pct, isErr){
+  const s = $('status');
+  s.className = 'show' + (isErr ? ' err' : '');
+  $('statusText').textContent = msg;
+  $('statusBar').style.width = (pct||0) + '%';
+  if (isErr) setTimeout(()=>{ s.className=''; }, 6000);
+}
+function clearStatus(){ $('status').className=''; }
+
+// downscale photo before OCR — faster and often MORE accurate
+function downscale(file, maxDim){
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * scale);
+      c.height = Math.round(img.height * scale);
+      const ctx = c.getContext('2d');
+      // grayscale + contrast bump helps thermal receipts
+      ctx.filter = 'grayscale(1) contrast(1.3)';
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      resolve(c);
+      URL.revokeObjectURL(img.src);
+    };
+    img.onerror = reject;
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+let ocrWorker = null; // reuse across scans — engine loads once
+
+async function getWorker(){
+  if (ocrWorker) return ocrWorker;
+  if (typeof Tesseract === 'undefined')
+    throw new Error('OCR library failed to load — check your internet connection.');
+  ocrWorker = await Tesseract.createWorker('eng', 1, {
+    logger: m => {
+      if (m.status === 'recognizing text')
+        setStatus('Reading receipt…', 20 + Math.round(m.progress * 75));
+      else if (m.progress != null)
+        setStatus('Loading OCR engine… (' + m.status + ')', 5 + Math.round(m.progress * 15));
+    }
+  });
+  return ocrWorker;
+}
+
+async function scanImage(file){
+  try {
+    setStatus('Preparing image…', 5);
+    const canvas = await downscale(file, 1600);
+    setStatus('Loading OCR engine (first scan downloads ~10 MB)…', 10);
+    const worker = await getWorker();
+    const result = await worker.recognize(canvas);
+    const parsed = parseReceipt(result.data.text);
+    if (!parsed.items.length && parsed.total == null) {
+      setStatus('Could not read this receipt — try a flatter, brighter photo.', 0, true);
+      return;
+    }
+    receipts.push(parsed);
+    clearStatus();
+    render();
+  } catch (err) {
+    console.error(err);
+    ocrWorker = null; // force fresh engine on retry
+    const msg = (err && err.message) ? err.message
+      : 'the OCR engine could not download its files. This usually means the page is running in a restricted preview — save this file and open it in Safari directly.';
+    setStatus('OCR failed: ' + msg, 0, true);
+  }
+}
+
+/* ---------- parsing: turn raw OCR text into structured data ---------- */
+function parseReceipt(text){
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const priceRe = /(.*?)[\s.]*\$?\s*(-?\d{1,5}[.,]\d{2})\s*$/;
+  const dateRe  = /(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})|(\d{4}-\d{2}-\d{2})/;
+  const skipRe  = /^(visa|mastercard|amex|debit|credit|cash|change|tend|auth|approval|card|account|balance|x{2,})/i;
+  const taxRe   = /\b(tax|hst|gst|pst|vat)\b/i;
+  const totalRe = /\btotal\b/i;
+  const subRe   = /\bsub[\s-]?total\b/i;
+
+  const r = { id: Date.now(), merchant: '', date: '', items: [], tax: null, total: null };
+
+  // merchant: first line with letters that isn't a date/address-ish number blob
+  for (const l of lines.slice(0, 4)){
+    if (/[A-Za-z]{3,}/.test(l) && !dateRe.test(l)) { r.merchant = l.replace(/[^\w\s&'.-]/g,'').trim(); break; }
+  }
+  if (!r.merchant) r.merchant = 'Unknown merchant';
+
+  for (const l of lines){
+    if (!r.date){ const d = l.match(dateRe); if (d) r.date = d[0]; }
+    const m = l.match(priceRe);
+    if (!m) continue;
+    const name = m[1].trim();
+    const price = parseFloat(m[2].replace(',', '.'));
+    if (isNaN(price)) continue;
+
+    if (subRe.test(name)) continue;                       // skip subtotal rows
+    if (totalRe.test(name)) { r.total = price; continue } // capture total
+    if (taxRe.test(name))   { r.tax = (r.tax||0) + price; continue }
+    if (skipRe.test(name) || !name) continue;             // skip payment noise
+    if (price > 10000) continue;                          // junk guard
+    r.items.push({ name: name.replace(/\s{2,}/g,' '), price });
+  }
+  // fall back: if no TOTAL keyword found, use items + tax
+  if (r.total == null && r.items.length)
+    r.total = +(r.items.reduce((s,i)=>s+i.price,0) + (r.tax||0)).toFixed(2);
+  return r;
+}
+
+/* ---------- rendering ---------- */
+const fmt = n => '$' + (n==null ? '0.00' : n.toFixed(2));
+
+function render(){
+  $('empty').style.display = receipts.length ? 'none' : 'block';
+  $('statCount').textContent = receipts.length;
+  $('statTotal').textContent = fmt(receipts.reduce((s,r)=>s+(r.total||0),0));
+  $('btnCsv').disabled = !receipts.length;
+
+  // remove old cards
+  document.querySelectorAll('.receipt').forEach(el => el.remove());
+
+  for (const r of receipts){
+    const card = document.createElement('div');
+    card.className = 'receipt';
+    card.innerHTML = `
+      <div class="head">
+        <div>
+          <div class="merchant" contenteditable data-id="${r.id}" data-f="merchant">${esc(r.merchant)}</div>
+          <div class="date" contenteditable data-id="${r.id}" data-f="date">${esc(r.date)||'date?'}</div>
+        </div>
+        <button class="del" data-id="${r.id}">✕ remove</button>
+      </div>
+      <hr>
+      ${r.items.map(i=>`<div class="line"><span class="name">${esc(i.name)}</span><span class="price">${fmt(i.price)}</span></div>`).join('')}
+      ${r.tax!=null?`<div class="line tax"><span class="name">TAX</span><span class="price">${fmt(r.tax)}</span></div>`:''}
+      <div class="line total"><span class="name">TOTAL</span>
+        <span class="price" contenteditable data-id="${r.id}" data-f="total">${fmt(r.total)}</span></div>`;
+    $('stack').appendChild(card);
+  }
+}
+function esc(s){ return String(s||'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// inline edits + delete (event delegation)
+document.addEventListener('focusout', e => {
+  const el = e.target.closest('[contenteditable]'); if (!el) return;
+  const r = receipts.find(x => x.id == el.dataset.id); if (!r) return;
+  const f = el.dataset.f, v = el.textContent.trim();
+  if (f === 'total'){ const n = parseFloat(v.replace(/[^0-9.-]/g,'')); if(!isNaN(n)) r.total=n; render(); }
+  else { r[f] = v; }
+  $('statTotal').textContent = fmt(receipts.reduce((s,x)=>s+(x.total||0),0));
+});
+document.addEventListener('click', e => {
+  const btn = e.target.closest('.del'); if (!btn) return;
+  const i = receipts.findIndex(x => x.id == btn.dataset.id);
+  if (i > -1){ receipts.splice(i,1); render(); }
+});
+
+/* ---------- CSV export: one row per line item, plus tax & total rows ---------- */
+$('btnCsv').addEventListener('click', () => {
+  const rows = [['receipt_id','merchant','date','row_type','item','amount']];
+  for (const r of receipts){
+    for (const i of r.items) rows.push([r.id, r.merchant, r.date, 'item', i.name, i.price.toFixed(2)]);
+    if (r.tax!=null)   rows.push([r.id, r.merchant, r.date, 'tax',   '', r.tax.toFixed(2)]);
+    if (r.total!=null) rows.push([r.id, r.merchant, r.date, 'total', '', r.total.toFixed(2)]);
+  }
+  const csv = rows.map(row => row.map(c => `"${String(c).replace(/"/g,'""')}"`).join(',')).join('\r\n');
+  const blob = new Blob(["﻿" + csv], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'receipts-' + new Date().toISOString().slice(0,10) + '.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+});
+</script>
+</body>
+</html>
