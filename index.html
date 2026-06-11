@@ -6,6 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>Receipt Scanner — Offline OCR</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <style>
   :root{
     --paper:#FCFBF7;
@@ -46,13 +47,16 @@
   .stat .label{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#5C6B61}
   .stat .value{font-size:20px;font-weight:700;font-family:ui-monospace,monospace}
 
-  .actions{display:flex;gap:10px;padding:12px 16px}
+  .actions{display:flex;gap:10px;padding:12px 16px 4px}
+  .actions.bottom{padding-top:0;padding-bottom:12px}
   button{
     font:inherit;border:none;border-radius:12px;padding:14px 16px;font-weight:700;
     font-size:15px;cursor:pointer;flex:1;
   }
   .btn-scan{background:var(--ledger);color:#fff}
   .btn-scan:active{transform:scale(.98)}
+  .btn-upload{background:var(--paper);color:var(--ledger);border:1.5px solid var(--ledger)}
+  .btn-upload:active{transform:scale(.98)}
   .btn-csv{background:var(--paper);color:var(--ledger);border:1.5px solid var(--ledger)}
   .btn-csv:disabled{opacity:.4}
   input[type=file]{display:none}
@@ -67,7 +71,6 @@
   .bar{height:4px;background:#fff;border-radius:2px;margin-top:8px;overflow:hidden}
   .bar i{display:block;height:100%;width:0;background:var(--ledger);transition:width .2s}
 
-  /* the receipt stack */
   #stack{padding:10px 16px;display:flex;flex-direction:column;gap:18px}
   .receipt{
     background:var(--paper);
@@ -114,7 +117,6 @@
   }
   .empty .mono{display:block;font-size:32px;margin-bottom:12px}
 
-  /* live camera overlay */
   #camOverlay{position:fixed;inset:0;background:#000;z-index:50;display:none;flex-direction:column}
   #camOverlay.show{display:flex}
   #camVideo{flex:1;width:100%;min-height:0;object-fit:cover}
@@ -143,10 +145,17 @@
 </div>
 
 <div class="actions">
-  <button class="btn-scan" id="btnScan">📷 Scan receipt</button>
+  <button class="btn-scan" id="btnScan">📷 Camera</button>
+  <button class="btn-upload" id="btnUpload">📁 Upload</button>
+</div>
+<div class="actions bottom">
   <button class="btn-csv" id="btnCsv" disabled>Export CSV</button>
 </div>
+
+<!-- camera: forces live viewfinder -->
 <input type="file" id="fileInput" accept="image/*" capture="environment">
+<!-- upload: opens photo library + files app, accepts images and PDFs -->
+<input type="file" id="uploadInput" accept="image/*,.pdf" multiple>
 
 <div id="camOverlay">
   <div class="cam-hint">Fill the frame with the receipt</div>
@@ -163,11 +172,15 @@
 <div id="stack">
   <div class="empty" id="empty">
     <span class="mono">⌁</span>
-    No receipts yet.<br>Tap <b>Scan receipt</b> to photograph one — everything runs on your phone, nothing is uploaded.
+    No receipts yet.<br>Tap <b>Camera</b> to photograph one, or <b>Upload</b> to pick a JPG/PNG/PDF — everything runs on your phone, nothing is uploaded.
   </div>
 </div>
 
 <script>
+// Point PDF.js worker at the matching CDN build
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
 const receipts = [];
 const $ = id => document.getElementById(id);
 
@@ -180,9 +193,8 @@ const $ = id => document.getElementById(id);
   }
 })();
 
-/* ---------- live camera ---------- */
+/* ---------- camera ---------- */
 let camStream = null;
-
 $('btnScan').addEventListener('click', openCamera);
 
 async function openCamera(){
@@ -220,12 +232,24 @@ $('camShutter').addEventListener('click', () => {
 });
 
 $('fileInput').addEventListener('change', async e => {
-  const file = e.target.files[0];
-  e.target.value = '';
-  if (!file) return;
-  await scanImage(file);
+  const file = e.target.files[0]; e.target.value = '';
+  if (file) await scanImage(file);
 });
 
+/* ---------- upload (images + PDFs) ---------- */
+$('btnUpload').addEventListener('click', () => $('uploadInput').click());
+
+$('uploadInput').addEventListener('change', async e => {
+  const files = Array.from(e.target.files); e.target.value = '';
+  for (const file of files){
+    if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf'))
+      await scanPdf(file);
+    else
+      await scanImage(file);
+  }
+});
+
+/* ---------- status helpers ---------- */
 function setStatus(msg, pct, isErr){
   const s = $('status');
   s.className = 'show' + (isErr ? ' err' : '');
@@ -235,14 +259,13 @@ function setStatus(msg, pct, isErr){
 }
 function clearStatus(){ $('status').className=''; }
 
-// Upscale small receipts, cap huge photos — better OCR on both ends
+/* ---------- image preprocessing ---------- */
 function prepareImage(file){
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
       const longest = Math.max(img.width, img.height);
       const TARGET = 2000;
-      // upscale small images up to 2×; shrink very large ones down to TARGET
       const scale = longest < TARGET
         ? Math.min(2, TARGET / longest)
         : Math.min(1, TARGET / longest);
@@ -260,6 +283,7 @@ function prepareImage(file){
   });
 }
 
+/* ---------- OCR worker ---------- */
 let ocrWorker = null;
 
 async function getWorker(){
@@ -274,41 +298,93 @@ async function getWorker(){
         setStatus('Loading OCR engine… (' + m.status + ')', 5 + Math.round(m.progress * 15));
     }
   });
-  // PSM 4 = single column of variable-size text — much better for receipts than default PSM 3
   await ocrWorker.setParameters({ tessedit_pageseg_mode: '4' });
   return ocrWorker;
 }
 
+/* ---------- shared: OCR a canvas and add result ---------- */
+async function ocrAndAdd(canvas, label){
+  setStatus(label || 'Reading receipt…', 20);
+  const worker = await getWorker();
+  const { data } = await worker.recognize(canvas);
+  const parsed = parseReceipt(data.text);
+  if (parsed.items.length || parsed.total != null){
+    receipts.push(parsed);
+    return true;
+  }
+  return false;
+}
+
+/* ---------- scan a photo/image file ---------- */
 async function scanImage(file){
   try {
     setStatus('Preparing image…', 5);
     const canvas = await prepareImage(file);
     setStatus('Loading OCR engine (first scan downloads ~10 MB)…', 10);
-    const worker = await getWorker();
-    const result = await worker.recognize(canvas);
-    const parsed = parseReceipt(result.data.text);
-    if (!parsed.items.length && parsed.total == null) {
-      setStatus('Could not read this receipt — try a flatter, brighter photo.', 0, true);
-      return;
-    }
-    receipts.push(parsed);
-    clearStatus();
-    render();
+    const ok = await ocrAndAdd(canvas);
+    if (!ok) setStatus('Could not read this receipt — try a flatter, brighter photo.', 0, true);
+    else { clearStatus(); render(); }
   } catch (err) {
-    console.error(err);
-    ocrWorker = null;
-    const msg = (err && err.message) ? err.message
-      : 'the OCR engine could not download its files. This usually means the page is running in a restricted preview — save this file and open it in Safari directly.';
-    setStatus('OCR failed: ' + msg, 0, true);
+    handleErr(err);
   }
 }
 
+/* ---------- scan a PDF (one receipt card per page) ---------- */
+const PDF_PAGE_LIMIT = 10;
+
+async function scanPdf(file){
+  try {
+    setStatus('Loading PDF…', 5);
+    const url = URL.createObjectURL(file);
+    const pdf = await pdfjsLib.getDocument(url).promise;
+    URL.revokeObjectURL(url);
+
+    const total = Math.min(pdf.numPages, PDF_PAGE_LIMIT);
+    if (pdf.numPages > PDF_PAGE_LIMIT)
+      setStatus(`PDF has ${pdf.numPages} pages — scanning first ${PDF_PAGE_LIMIT}…`, 8);
+    else
+      setStatus(`PDF has ${total} page(s) — loading OCR engine…`, 8);
+
+    await getWorker(); // pre-load engine before the loop
+
+    let added = 0;
+    for (let p = 1; p <= total; p++){
+      setStatus(`Rendering page ${p}/${total}…`, 10 + Math.round((p-1)/total * 10));
+
+      const page = await pdf.getPage(p);
+      const viewport = page.getViewport({ scale: 2.5 }); // high-res render for OCR
+      const raw = document.createElement('canvas');
+      raw.width = viewport.width; raw.height = viewport.height;
+      await page.render({ canvasContext: raw.getContext('2d'), viewport }).promise;
+
+      // apply same preprocessing as photos
+      const processed = document.createElement('canvas');
+      processed.width = raw.width; processed.height = raw.height;
+      const ctx = processed.getContext('2d');
+      ctx.filter = 'grayscale(1) contrast(1.6)';
+      ctx.drawImage(raw, 0, 0);
+
+      const ok = await ocrAndAdd(processed, `Reading page ${p}/${total}…`);
+      if (ok) added++;
+    }
+
+    if (added === 0) setStatus('Could not parse any receipts from this PDF.', 0, true);
+    else { clearStatus(); render(); }
+  } catch (err) {
+    handleErr(err);
+  }
+}
+
+function handleErr(err){
+  console.error(err);
+  ocrWorker = null;
+  const msg = (err && err.message) ? err.message
+    : 'the OCR engine could not download its files. Open this page in Safari directly.';
+  setStatus('Error: ' + msg, 0, true);
+}
+
 /* ---------- parsing ---------- */
-
-// Known store names — matched against every line before falling back to heuristics
-const KNOWN_STORES = /\b(walmart|wal[\s*-]?mart|target|costco|kroger|safeway|whole\s*foods|trader\s*joe['s]*|cvs|walgreens|rite\s*aid|dollar\s*tree|dollar\s*general|family\s*dollar|aldi|lidl|publix|h[\s.]*e[\s.]*b|meijer|wegmans|food\s*lion|winco|sprouts|tj\s*maxx|homegoods|marshalls|home\s*depot|lowe['s]*|best\s*buy|staples|office\s*depot|amazon|mcdonald['s]*|starbucks|subway|chick[\s-]fil|chipotle|domino['s]*|pizza\s*hut|taco\s*bell|burger\s*king|wendy['s]*|sonic|panera|dunkin|in[\s-]n[\s-]out|trader\s*joe)\b/i;
-
-// Lines that look like footer/promo text — skip when guessing merchant from position
+const KNOWN_STORES = /\b(walmart|wal[\s*-]?mart|target|costco|kroger|safeway|whole\s*foods|trader\s*joe['s]*|cvs|walgreens|rite\s*aid|dollar\s*tree|dollar\s*general|family\s*dollar|aldi|lidl|publix|h[\s.]*e[\s.]*b|meijer|wegmans|food\s*lion|winco|sprouts|tj\s*maxx|homegoods|marshalls|home\s*depot|lowe['s]*|best\s*buy|staples|office\s*depot|amazon|mcdonald['s]*|starbucks|subway|chick[\s-]fil|chipotle|domino['s]*|pizza\s*hut|taco\s*bell|burger\s*king|wendy['s]*|sonic|panera|dunkin|in[\s-]n[\s-]out)\b/i;
 const JUNK_MERCHANT = /\b(feedback|survey|thank|cashier|register|mgr|manager|tel|phone|fax|www\.|\.com|\.net|scan|download|app|welcome|invite|save\s+big|follow\s+us|receipt\s*#|transaction|approval|auth)\b/i;
 
 function parseReceipt(text){
@@ -322,22 +398,17 @@ function parseReceipt(text){
 
   const r = { id: Date.now(), merchant: '', date: '', items: [], tax: null, total: null };
 
-  // 1. Scan ALL lines for a known store name first (most reliable)
   for (const l of lines){
     const m = l.match(KNOWN_STORES);
     if (m){ r.merchant = m[0].trim(); break; }
   }
-
-  // 2. Fall back: first non-junk line in the top 8 that has real letters
   if (!r.merchant){
     for (const l of lines.slice(0, 8)){
       if (/[A-Za-z]{3,}/.test(l) && !dateRe.test(l) && !JUNK_MERCHANT.test(l) && !/^\d/.test(l)){
-        r.merchant = l.replace(/[^\w\s&'.-]/g,'').trim();
-        break;
+        r.merchant = l.replace(/[^\w\s&'.-]/g,'').trim(); break;
       }
     }
   }
-
   if (!r.merchant) r.merchant = 'Unknown merchant';
 
   for (const l of lines){
@@ -347,7 +418,6 @@ function parseReceipt(text){
     const name  = m[1].trim();
     const price = parseFloat(m[2].replace(',', '.'));
     if (isNaN(price)) continue;
-
     if (subRe.test(name))   continue;
     if (totalRe.test(name)) { r.total = price; continue; }
     if (taxRe.test(name))   { r.tax = (r.tax||0) + price; continue; }
@@ -355,7 +425,6 @@ function parseReceipt(text){
     if (price > 10000) continue;
     r.items.push({ name: name.replace(/\s{2,}/g,' '), price });
   }
-
   if (r.total == null && r.items.length)
     r.total = +(r.items.reduce((s,i)=>s+i.price,0) + (r.tax||0)).toFixed(2);
   return r;
@@ -369,9 +438,7 @@ function render(){
   $('statCount').textContent = receipts.length;
   $('statTotal').textContent = fmt(receipts.reduce((s,r)=>s+(r.total||0),0));
   $('btnCsv').disabled = !receipts.length;
-
   document.querySelectorAll('.receipt').forEach(el => el.remove());
-
   for (const r of receipts){
     const card = document.createElement('div');
     card.className = 'receipt';
